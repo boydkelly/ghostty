@@ -40,15 +40,17 @@ Ghostty is a fast, feature-rich, and cross-platform terminal emulator that uses
 platform-native UI and GPU acceleration.
 %prep
 {{{git_setup_macro path="$GIT_ROOT"}}}
+
 %build
 # Download deps to enable system integrations.
 # https://github.com/ghostty-org/ghostty/issues/6632#issuecomment-2722745586
 export ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-offline-cache"
 ./nix/build-support/fetch-zig-cache.sh
 
-# Fallback: fetch all dependencies listed in build.zig.zon in case
-# fetch-zig-cache.sh / build.zig.zon.txt is out of sync upstream.
-grep -o 'https://[^"]*' build.zig.zon | xargs -r -n 1 zig fetch
+# Fallback: parse only explicit .url fields from build.zig.zon to bypass comment noise
+grep -E '\.url\s*=\s*"' build.zig.zon | sed -n 's/.*\.url\s*=\s*"\([^"]*\)".*/\1/p' | while read -r url; do
+    [ -n "$url" ] && zig fetch "$url"
+done
 
 # Replace the caret in the rpm version with something that doesn't break Zig.
 v="%{version}-%{release}"
@@ -63,6 +65,7 @@ zig build \
     -Dcpu=baseline \
     -Dpie=true \
     -Demit-docs
+
 # Resolve Fedora 42 ncurses-term conflict.
 %if 0%{?fedora} >= 42
 rm -rf "%{buildroot}%{_datadir}/terminfo"
