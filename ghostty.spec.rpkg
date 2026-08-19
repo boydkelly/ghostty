@@ -40,17 +40,11 @@ the latest development tip from the official GitHub releases.
 tar -xzf %{SOURCE0} --strip-components=1
 
 %build
-zig build \
-    --summary all \
-    --prefix "%{_prefix}" \
-    -Doptimize=ReleaseFast \
-    -Dcpu=baseline \
-    -Dpie=true \
-    -Demit-docs
-
-%install
+# Ghostty's Zig build performs compilation and installation together.
+# Stage the result into the RPM buildroot.
 DESTDIR="%{buildroot}" \
 zig build \
+    --summary all \
     --prefix "%{_prefix}" \
     -Doptimize=ReleaseFast \
     -Dcpu=baseline \
