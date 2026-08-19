@@ -22,7 +22,7 @@ BuildRequires:  libadwaita-devel
 BuildRequires:  gettext
 BuildRequires:  zig
 
-# The %global definitions align with rpmmacros used by the upstream
+# The global definitions align with rpmmacros used by the upstream
 %global _product_license BSD-2-Clause
 %global _product_url %{url}
 %global _product_source0 %{Source0}
@@ -40,18 +40,31 @@ the latest development tip from the official GitHub releases.
 tar -xzf %{SOURCE0} --strip-components=1
 
 %build
+zig build \
+    --summary all \
+    --prefix "%{_prefix}" \
+    -Doptimize=ReleaseFast \
+    -Dcpu=baseline \
+    -Dpie=true \
+    -Demit-docs
+
+%install
 DESTDIR="%{buildroot}" \
 zig build \
     --prefix "%{_prefix}" \
-    -Doptimize=ReleaseFast
+    -Doptimize=ReleaseFast \
+    -Dcpu=baseline \
+    -Dpie=true \
+    -Demit-docs
 
-%install
 # zig build installs everything into %{buildroot} via DESTDIR
 %if 0%{?fedora} >= 42
 rm -rf "%{buildroot}%{_datadir}/terminfo"
 %endif
+
 # Remove libghostty which doesn't pertain yet.
 rm -f "%{buildroot}/usr/lib/libghostty"*
+
 # Find the files because manually listing them is boring.
 find "%{buildroot}" -type f \
     ! -path "%{buildroot}%{_datadir}/ghostty/*" |
@@ -60,6 +73,7 @@ sed 's,^%{buildroot},,' > files
 %files -f files
 %license LICENSE
 %{_datadir}/ghostty
+
 %changelog
 * {{{ghostty_changelog_date}}} Boyd Kelly <bkelly@coastsystems.net> - {{{ghostty_version}}}-{{{ghostty_release}}}
 - Nightly tip build from ghostty-source.tar.gz (GitHub tip release)
