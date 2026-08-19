@@ -1,72 +1,52 @@
-# vim:ft=spec:
-Name:           {{{git_name name="ghostty"}}}
-Version:        {{{git_version}}}
-Release:        {{{git_revision}}}%{?dist}
-Summary:        GPU-accelerated terminal with GTK4 UI
-License:        MIT
+# -*- mode: spec; package-name: ghostty; version: 0; -*-
+
+# Ghostty - A fast, GPU-accelerated terminal emulator
+# Fedora spec file for tip (development) build
+#
+# This spec intentionally keeps dependencies minimal while following
+# the version conventions and changelog macros used by the official
+# ghostty.spec.rpkg.
+
+Name:           ghostty
+Version:        {{{ghostty_version}}}
+Release:        {{{ghostty_release}}}%{?dist}
+Summary:        Fast terminal emulator using modern graphics APIs
+License:        BSD-2-Clause
 URL:            https://github.com/ghostty-org/ghostty
-Source0:        {{{git_repo_pack}}}
-BuildRequires: blueprint-compiler
-BuildRequires: fontconfig-devel
-BuildRequires: freetype-devel
-BuildRequires: glib2-devel
-BuildRequires: glslang-devel
-BuildRequires: gtk4-devel
-BuildRequires: gtk4-layer-shell-devel
-BuildRequires: harfbuzz-devel
-BuildRequires: libadwaita-devel
-BuildRequires: libpng-devel
-BuildRequires: libxml2-devel
-BuildRequires: oniguruma-devel
-BuildRequires: pandoc-cli
-BuildRequires: pixman-devel
-BuildRequires: pkg-config
-BuildRequires: simdutf-devel
-BuildRequires: wayland-protocols-devel
-BuildRequires: zig
-BuildRequires: zlib-ng-devel
-Requires: fontconfig
-Requires: freetype
-Requires: glib2
-Requires: gtk4
-Requires: harfbuzz
-Requires: libadwaita
-Requires: libpng
-Requires: oniguruma
-Requires: pixman
-Requires: zlib-ng
+Source0:        https://github.com/ghostty-org/ghostty/releases/download/tip/ghostty-source.tar.gz
+
+# Minimal set of build dependencies for a tip build
+BuildRequires:  gtk4-devel
+BuildRequires:  gtk4-layer-shell-devel
+BuildRequires:  libadwaita-devel
+BuildRequires:  gettext
+BuildRequires:  zig
+
+# The %global definitions align with rpmmacros used by the upstream
+%global _product_license BSD-2-Clause
+%global _product_url %{url}
+%global _product_source0 %{Source0}
+
 %description
-Ghostty is a fast, feature-rich, and cross-platform terminal emulator that uses
-platform-native UI and GPU acceleration.
+Ghostty is a fast, cross‑platform terminal emulator that leverages
+GPU‑accelerated graphics through GTK4 and libadwaita.  This spec builds
+the latest development tip from the official GitHub releases.
+
 %prep
-{{{git_setup_macro path="$GIT_ROOT"}}}
+# The tip tarball unpacks into a versioned top directory
+# (e.g. ghostty-1.3.2-main-+7f62fe7/); strip that component so we
+# don't depend on the exact name, which changes every commit.
+%setup -q -c -T
+tar -xzf %{SOURCE0} --strip-components=1
 
 %build
-# Download deps to enable system integrations.
-# https://github.com/ghostty-org/ghostty/issues/6632#issuecomment-2722745586
-export ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-offline-cache"
-./nix/build-support/fetch-zig-cache.sh
-
-# Fallback: parse only explicit .url fields from build.zig.zon to bypass comment noise
-grep -E '\.url\s*=\s*"' build.zig.zon | sed -n 's/.*\.url\s*=\s*"\([^"]*\)".*/\1/p' | while read -r url; do
-    [ -n "$url" ] && zig fetch "$url"
-done
-
-# Replace the caret in the rpm version with something that doesn't break Zig.
-v="%{version}-%{release}"
-v="${v/^/+}"
 DESTDIR="%{buildroot}" \
 zig build \
-    --summary all \
     --prefix "%{_prefix}" \
-    --system "$ZIG_GLOBAL_CACHE_DIR/p" \
-    -Dversion-string="$v" \
-    -Doptimize=ReleaseFast \
-    -Dcpu=baseline \
-    -Dpie=true \
-    -Demit-docs
+    -Doptimize=ReleaseFast
 
-# Resolve Fedora 42 ncurses-term conflict.
+%install
+# zig build installs everything into %{buildroot} via DESTDIR
 %if 0%{?fedora} >= 42
 rm -rf "%{buildroot}%{_datadir}/terminfo"
 %endif
@@ -80,5 +60,5 @@ grep -v '^%{_datadir}/ghostty/' > files
 %license LICENSE
 %{_datadir}/ghostty
 %changelog
-* {{{git_changelog_date}}} Aron Griffis <aron@scampersand.com> - {{{git_changelog_version}}}
-- Nightly build from git master
+* {{{ghostty_changelog_date}}} Boyd Kelly <bkelly@coastsystems.net> - {{{ghostty_version}}}-{{{ghostty_release}}}
+- Nightly tip build from ghostty-source.tar.gz (GitHub tip release)
