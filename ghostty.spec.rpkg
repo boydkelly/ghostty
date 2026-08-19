@@ -53,9 +53,10 @@ rm -rf "%{buildroot}%{_datadir}/terminfo"
 # Remove libghostty which doesn't pertain yet.
 rm -f "%{buildroot}/usr/lib/libghostty"*
 # Find the files because manually listing them is boring.
-find "%{buildroot}" -type f | \
-sed 's,^%{buildroot},,' | \
-grep -v '^%{_datadir}/ghostty/' > files
+find "%{buildroot}" -type f \
+    ! -path "%{buildroot}%{_datadir}/ghostty/*" |
+sed 's,^%{buildroot},,' > files
+
 %files -f files
 %license LICENSE
 %{_datadir}/ghostty
