@@ -20,7 +20,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
       - name: Add upstream and fetch
         run: |
-          git remote add upstream https://github.com/ghostty-org/ghostty.git
+          git remote add upstream https://github.com/agriffis/ghostty.git
           git fetch upstream
       - name: Fast-forward main from upstream
         run: |
