@@ -13,12 +13,12 @@ function git_version {
   # git describe --first-parent origin/main
   # tip-0-g8f5f432a
   declare describe tag commits hash _
-  describe=$(git describe --first-parent --long origin/main)
+  describe=$(git describe --first-parent --long HEAD)
   read tag commits hash <<<"${describe//-/ }"
   hash=${hash#g} # git prepends g to indicate git
   if [[ $tag == tip ]]; then
     # v1.0.1-56-g1baf8928
-    describe=$(git describe --first-parent --long origin/main^)
+    describe=$(git describe --first-parent --long HEAD^)
     read tag commits _ <<<"${describe//-/ }"
     tag=${describe%%-*}
     commits=$((commits + 1))
