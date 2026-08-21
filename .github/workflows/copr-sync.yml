@@ -23,16 +23,16 @@ jobs:
           git fetch upstream --tags --force
       - name: Fast-forward main from upstream
         run: |
-          git checkout -B main origin/main
+          git checkout main
           git merge --ff-only upstream/main
           git push origin main
-          git push origin --tags --force
+          git push origin tip --force
       - name: Merge main into nightly
         run: |
-          git checkout -B nightly origin/nightly
+          git checkout nightly
           git merge main --no-edit
           git push origin nightly --force
-          git push origin --tags --force
+          git push origin tip --force
 
 # - name: Rebase nightly onto main
 #   run: |
