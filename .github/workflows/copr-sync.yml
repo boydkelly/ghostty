@@ -1,5 +1,4 @@
-# .github/workflows/sync.yml
-name: COPR sync upstream
+name: Sync upstream and merge into local
 permissions:
   contents: write
 on:
@@ -22,13 +21,12 @@ jobs:
         run: |
           git remote add upstream https://github.com/agriffis/ghostty.git
           git fetch upstream
-      - name: Fast-forward main from upstream
+      - name: Sync main with upstream
         run: |
-          git checkout main
-          git merge --ff-only upstream/main
-          git push origin main
+          git checkout -B main upstream/main
+          git push origin main --force
       - name: Merge main into nightly
         run: |
-          git checkout nightly
+          git checkout -B nightly origin/nightly
           git merge main --no-edit
           git push origin nightly
