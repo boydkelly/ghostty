@@ -20,7 +20,7 @@ jobs:
       - name: Add upstream and fetch with tags
         run: |
           git remote add upstream https://github.com/agriffis/ghostty.git
-          git fetch upstream --tags
+          git fetch upstream --tags --force
       - name: Fast-forward main from upstream
         run: |
           git checkout -B main origin/main
