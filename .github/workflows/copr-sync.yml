@@ -26,8 +26,9 @@ jobs:
           git checkout -B main origin/main
           git merge --ff-only upstream/main
           git push origin main
+          git push origin --tags --force
       - name: Merge main into nightly
         run: |
           git checkout -B nightly origin/nightly
-          git merge --ff-only --no-edit upstream/main
+          git merge main --no-edit
           git push origin nightly
