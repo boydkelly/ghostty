@@ -17,14 +17,15 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-      - name: Add upstream and fetch
+      - name: Add upstream and fetch with tags
         run: |
           git remote add upstream https://github.com/agriffis/ghostty.git
-          git fetch upstream
-      - name: Sync main with upstream
+          git fetch upstream --tags
+      - name: Fast-forward main from upstream
         run: |
-          git checkout -B main upstream/main
-          git push origin main --force
+          git checkout -B main origin/main
+          git merge --ff-only upstream/main
+          git push origin main --tags
       - name: Merge main into nightly
         run: |
           git checkout -B nightly origin/nightly
