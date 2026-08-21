@@ -29,5 +29,5 @@ jobs:
       - name: Merge main into nightly
         run: |
           git checkout -B nightly origin/nightly
-          git merge main --no-edit
+          git merge --ff-only --no-edit upstream/main
           git push origin nightly
