@@ -27,8 +27,15 @@ jobs:
           git merge --ff-only upstream/main
           git push origin main
           git push origin --tags --force
-      - name: Rebase nightly onto main
+      - name: Merge main into nightly
         run: |
           git checkout -B nightly origin/nightly
-          git rebase main
+          git merge main --no-edit
           git push origin nightly --force
+          git push origin --tags --force
+
+# - name: Rebase nightly onto main
+#   run: |
+#     git checkout -B nightly origin/nightly
+#     git rebase main
+#     git push origin nightly --force
