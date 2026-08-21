@@ -1,5 +1,5 @@
 # .github/workflows/sync.yml
-name: Sync upstream and merge into local
+name: COPR sync upstream
 permissions:
   contents: write
 on:
