@@ -129,6 +129,7 @@ pub const Action = union(Key) {
     color_operation: ColorOperation,
     semantic_prompt: SemanticPrompt,
     kitty_clipboard: KittyClipboard,
+    kitty_dnd: KittyDnd,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -229,6 +230,7 @@ pub const Action = union(Key) {
             "color_operation",
             "semantic_prompt",
             "kitty_clipboard",
+            "kitty_dnd",
         },
     );
 
@@ -414,6 +416,7 @@ pub const Action = union(Key) {
     pub const ClipboardContents = struct {
         kind: u8,
         data: []const u8,
+        terminator: osc.Terminator,
 
         pub const C = extern struct {
             kind: u8,
@@ -448,6 +451,8 @@ pub const Action = union(Key) {
     pub const SemanticPrompt = osc.Command.SemanticPrompt;
 
     pub const KittyClipboard = osc.Command.KittyClipboardProtocol;
+
+    pub const KittyDnd = osc.Command.KittyDndProtocol;
 };
 
 /// Returns a type that can process a stream of tty control characters.
@@ -2500,6 +2505,7 @@ pub fn Stream(comptime H: type) type {
                     self.handler.vt(.clipboard_contents, .{
                         .kind = clip.kind,
                         .data = clip.data,
+                        .terminator = clip.terminator,
                     });
                 },
 
@@ -2559,6 +2565,10 @@ pub fn Stream(comptime H: type) type {
                     self.handler.vt(.kitty_clipboard, v);
                 },
 
+                .kitty_dnd_protocol => |v| {
+                    self.handler.vt(.kitty_dnd, v);
+                },
+
                 .conemu_sleep,
                 .conemu_show_message_box,
                 .conemu_change_tab_title,
@@ -2569,7 +2579,6 @@ pub fn Stream(comptime H: type) type {
                 .conemu_output_environment_variable,
                 .conemu_run_process,
                 .kitty_text_sizing,
-                .kitty_dnd_protocol,
                 .kitty_desktop_notification,
                 .context_signal,
                 => {
