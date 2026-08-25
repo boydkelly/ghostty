@@ -21,7 +21,7 @@ function git_version {
     describe=$(git describe --first-parent --long origin/main^)
     read tag commits _ <<<"${describe//-/ }"
     tag=${describe%%-*}
-    commits=$(( commits + 1 ))
+    commits=$((commits + 1))
   fi
   [[ $tag == v* && $commits =~ ^[0-9]+$ && -n $hash ]] || abort "failed git describe"
 
