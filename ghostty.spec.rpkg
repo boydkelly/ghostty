@@ -40,13 +40,32 @@ the latest development tip from the official GitHub releases.
 %setup -q -c -T
 tar -xzf %{SOURCE0} --strip-components=1
 
-%build
 # Ghostty's Zig build performs compilation and installation together.
 # Stage the result into the RPM buildroot.
+
+%build
+export ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-offline-cache"
+echo "https://deps.files.ghostty.org/uucode-2826a37a4562284fdacd8fa029d49509cc9bffcd.tar.gz" >> build.zig.zon.txt
+./nix/build-support/fetch-zig-cache.sh
+
+# Unpack downloaded archives into directories required by zig build --system
+for archive in "$ZIG_GLOBAL_CACHE_DIR/p"/*.tar.gz; do
+    [ -f "$archive" ] || continue
+    target_dir="${archive%.tar.gz}"
+    if [ ! -d "$target_dir" ]; then
+        mkdir -p "$target_dir"
+        tar -xzf "$archive" -C "$target_dir" --strip-components=1
+    fi
+done
+
+v="%{version}-%{release}"
+v="${v/^/+}"
 DESTDIR="%{buildroot}" \
 zig build \
     --summary all \
     --prefix "%{_prefix}" \
+    --system "$ZIG_GLOBAL_CACHE_DIR/p" \
+    -Dversion-string="$v" \
     -Doptimize=ReleaseFast \
     -Dcpu=baseline \
     -Dpie=true \
