@@ -1,4 +1,4 @@
-name: Sync upstream and merge into local
+name: Copr sync
 permissions:
   contents: write
 on:

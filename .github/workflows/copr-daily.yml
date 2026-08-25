@@ -1,4 +1,4 @@
-name: Daily COPR build
+name: COPR Daily
 on:
   schedule:
     - cron: "0 4 * * *"
