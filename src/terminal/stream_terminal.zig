@@ -81,10 +81,15 @@ pub const Handler = struct {
     kitty_clipboard_write: ?*kitty_clipboard.WriteState = null,
 
     /// Kitty clipboard protocol (OSC 5522) session password grants,
-    /// recorded when a clipboard_read reply asks to remember the user's
-    /// decision. Later requests carrying a granted password are forwarded
-    /// with `granted` set so the embedder can skip its prompt.
+    /// recorded when a clipboard_read or clipboard_write reply asks to
+    /// remember the user's decision.
     kitty_clipboard_grants: kitty_clipboard.Grants = .{},
+
+    /// Maximum total decoded bytes accumulated by one Kitty clipboard
+    /// protocol (OSC 5522) write transaction, captured when the
+    /// transaction begins. Data beyond the limit fails the transaction
+    /// with EFBIG.
+    kitty_clipboard_write_max_bytes: usize = kitty_clipboard.max_write_size,
 
     /// Called for sequence identifiers not supported by this library.
     /// Currently, only APC is reported. Content is borrowed and only valid
@@ -108,7 +113,7 @@ pub const Handler = struct {
         /// e.g. in response to a DECRQM query. The data is only valid
         /// during the lifetime of the call so callers must copy it
         /// if it needs to be stored or used after the call returns.
-        write_pty: ?*const fn (*Handler, [:0]const u8) void,
+        write_pty: ?*const fn (*Handler, []const u8) void,
 
         /// Called when the bell is rung (BEL).
         bell: ?*const fn (*Handler) void,
@@ -161,26 +166,8 @@ pub const Handler = struct {
         /// Called when the running program reports progress via OSC 9;4.
         progress_report: ?*const fn (*Handler, osc.Command.ProgressReport) void,
 
-        /// Called when the running program writes to a clipboard. The write
-        /// has a normalized destination and one or more decoded MIME
-        /// representations. All request, MIME, and data memory is borrowed
-        /// and only valid for the duration of the callback.
-        ///
-        /// A write with no contents clears the destination. A content entry
-        /// with empty data is a distinct empty representation.
-        ///
-        /// OSC 52, OSC 1337 Copy, and Kitty clipboard (OSC 5522) writes all
-        /// share this callback. Every call is one complete write whose
-        /// contents replace whatever the destination previously held; there
-        /// is never a partial update. A Kitty clipboard write transaction
-        /// results in exactly one call, at commit, carrying all of the
-        /// transaction's representations, and the returned result is
-        /// reported back to the running program as the commit status (see
-        /// kittyClipboard).
-        ///
-        /// Clipboard read requests (OSC 52 with a "?" payload and OSC 5522
-        /// reads) are delivered to clipboard_read instead.
-        clipboard_write: ?*const fn (*Handler, clipboard.Write) clipboard.WriteResult,
+        /// Called when the running program writes to a clipboard.
+        clipboard_write: ?*const fn (*Handler, clipboard.Write) void,
 
         /// Called when the running program requests clipboard contents
         /// (OSC 52 with a "?" payload, or a Kitty clipboard (OSC 5522)
@@ -300,46 +287,53 @@ pub const Handler = struct {
         /// Nothing was written.
         UnsafePaste,
 
+        /// The contents reader failed. Nothing was written.
+        ReadFailed,
+
         /// No write_pty effect is set, so nothing can be written.
         NoWritePty,
     };
 
+    /// The size of the chunks a paste streams to write_pty in.
+    pub const paste_chunk_size = 4096;
+
     /// Paste into the terminal, applying the terminal's current state
     /// as necessary to owner mode 5522, bracketed paste, unsafe paste, etc.
     /// Returns true if anything was written to the pty.
+    ///
+    /// The output streams to write_pty in chunks of `paste_chunk_size`.
+    /// The contents are read at most once and only the pasted text
+    /// representation is ever read, buffered whole while it is checked
+    /// and encoded; see `terminal.paste`.
     pub fn paste(self: *Handler, req: Paste) PasteError!bool {
         if (self.effects.write_pty == null) return error.NoWritePty;
 
-        // One buffer for the whole result (frame + data + sentinel, or
-        // the event packets). Typical pastes stay on the stack.
-        const alloc = self.terminal.gpa();
-        var stack = std.heap.stackFallback(4096, alloc);
-        const stack_alloc = stack.get();
-        var aw: std.Io.Writer.Allocating = .init(stack_alloc);
-        defer aw.deinit();
+        var buf: [paste_chunk_size]u8 = undefined;
+        var pty: PtyWriter = .init(self, &buf);
+        // Delivered on error too: a partial paste has its frame closed
+        // and the program must see that.
+        defer pty.writer.flush() catch unreachable;
 
-        const written_any = paste_pkg.paste(.{
+        return paste_pkg.paste(.{
             .terminal = self.terminal,
-            .grants = &self.kitty_clipboard_grants,
-            .io = self.terminal.io(),
-            .alloc = alloc,
-            .can_event = self.effects.clipboard_read != null,
-            .writer = &aw.writer,
-        }, req) catch |err| return switch (err) {
-            // An allocating writer only fails to allocate.
-            error.WriteFailed => error.OutOfMemory,
+            .alloc = self.terminal.gpa(),
+            // Paste events need the program's follow-up Kitty
+            // clipboard read served.
+            .kitty_clipboard = if (self.effects.clipboard_read != null) .{
+                .grants = &self.kitty_clipboard_grants,
+                .io = self.terminal.io(),
+            } else null,
+            .writer = &pty.writer,
+        }, req) catch |err| switch (err) {
+            // The pty writer never fails.
+            error.WriteFailed => unreachable,
+            error.ReadFailed,
             error.OutOfMemory,
             error.UnsafePaste,
             error.EntropyUnavailable,
             error.Canceled,
             => |e| e,
         };
-        if (!written_any) return false;
-
-        const written = try aw.toOwnedSliceSentinel(0);
-        defer stack_alloc.free(written);
-        self.writePty(written);
-        return true;
     }
 
     pub fn vt(
@@ -529,7 +523,7 @@ pub const Handler = struct {
         }
     }
 
-    inline fn writePty(self: *Handler, data: [:0]const u8) void {
+    inline fn writePty(self: *Handler, data: []const u8) void {
         const func = self.effects.write_pty orelse return;
         func(self, data);
     }
@@ -654,9 +648,14 @@ pub const Handler = struct {
 
         // OSC 52 uses an empty payload to clear the selected clipboard.
         if (data.len == 0) {
-            _ = func(self, .{
+            func(self, .{
                 .location = location,
                 .contents = &.{},
+                .name = "",
+                .granted = false,
+                .can_remember = false,
+                .reply_ctx = self,
+                .reply_fn = &ignoreWriteReply,
             });
             return;
         }
@@ -673,11 +672,21 @@ pub const Handler = struct {
             .mime = "text/plain",
             .data = decoded,
         }};
-        _ = func(self, .{
+        func(self, .{
             .location = location,
             .contents = &contents,
+            .name = "",
+            .granted = false,
+            .can_remember = false,
+            .reply_ctx = self,
+            .reply_fn = &ignoreWriteReply,
         });
     }
+
+    /// Reply target for clipboard writes on protocols without a write
+    /// acknowledgement (OSC 52, OSC 1337 Copy): the reply is accepted
+    /// and discarded.
+    fn ignoreWriteReply(_: *anyopaque, _: clipboard.Write.Result) void {}
 
     fn clipboardRead(
         self: *Handler,
@@ -775,10 +784,24 @@ pub const Handler = struct {
         // Decode and validate the metadata.
         var arena: std.heap.ArenaAllocator = .init(self.terminal.gpa());
         defer arena.deinit();
-        const meta = (try kitty_clipboard.Metadata.parse(
+        const meta = (kitty_clipboard.Metadata.parse(
             arena.allocator(),
             v.metadata,
-        )) orelse return;
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidValue => {
+                const state = self.kitty_clipboard_write orelse return;
+                switch (kitty_clipboard.Metadata.operation(v.metadata) orelse return) {
+                    .wdata, .walias => self.kittyClipboardFinish(
+                        state,
+                        .EINVAL,
+                        v.terminator,
+                    ),
+                    .read, .write => {},
+                }
+                return;
+            },
+        }) orelse return;
 
         const payload = v.payload orelse "";
         switch (meta.op) {
@@ -806,6 +829,7 @@ pub const Handler = struct {
             error.Invalid => return,
         };
         defer decoded.deinit(alloc);
+        if (!decoded.isValidUtf8()) return;
 
         // Without a clipboard_read effect nothing can serve the read.
         // EPERM is the protocol's denial so clients degrade gracefully.
@@ -841,9 +865,14 @@ pub const Handler = struct {
         };
 
         // Per the spec a password without a name is no password. A
-        // stored grant for it lets the embedder skip its prompt.
+        // stored grant for it lets the embedder skip its prompt. A
+        // prompt-exempt request never consults the grants: the
+        // embedder serves it without a prompt anyway, and consuming a
+        // one-time paste password on a listing would burn the grant
+        // before the follow-up data read.
         const pw: []const u8 = if (meta.name.len > 0) meta.pw else "";
-        const granted = self.kitty_clipboard_grants.use(alloc, pw, .read);
+        const granted = !kitty_clipboard.readPromptExempt(mimes.len) and
+            self.kitty_clipboard_grants.use(alloc, pw, .read);
 
         var state: KittyClipboardReadState = .{
             .handler = self,
@@ -1002,7 +1031,9 @@ pub const Handler = struct {
         const alloc = self.terminal.gpa();
         const state = try alloc.create(kitty_clipboard.WriteState);
         errdefer alloc.destroy(state);
-        state.* = try .init(alloc, meta);
+        state.* = try .init(alloc, meta, .{
+            .max_size = self.kitty_clipboard_write_max_bytes,
+        });
         self.kitty_clipboard_write = state;
     }
 
@@ -1036,6 +1067,14 @@ pub const Handler = struct {
                 );
                 return error.OutOfMemory;
             },
+
+            // Data over the write limit aborts the transaction and is
+            // reported to the client.
+            error.TooLarge => self.kittyClipboardFinish(
+                state,
+                .EFBIG,
+                terminator,
+            ),
         };
     }
 
@@ -1045,10 +1084,15 @@ pub const Handler = struct {
         payload: []const u8,
         terminator: osc.Terminator,
     ) error{OutOfMemory}!void {
-        // Aliases without a transaction or without a target MIME type
-        // are silently ignored.
+        // Aliases without a transaction are silently ignored. Once a
+        // transaction exists, a missing target MIME type is invalid and
+        // aborts the transaction.
         const state = self.kitty_clipboard_write orelse return;
-        if (meta.mime.len == 0) return;
+        if (meta.mime.len == 0) return self.kittyClipboardFinish(
+            state,
+            .EINVAL,
+            terminator,
+        );
 
         state.alias(
             self.terminal.gpa(),
@@ -1087,27 +1131,86 @@ pub const Handler = struct {
         };
         defer committed.deinit(alloc);
 
-        // The effect result maps 1:1 onto the protocol's commit
-        // statuses. The effect can't be null here (checked when the
-        // transaction began) but if an embedder cleared it
-        // mid-transaction that's ENOSYS.
-        const result: clipboard.WriteResult = if (self.effects.clipboard_write) |func|
-            func(self, .{
-                .location = committed.loc,
-                .contents = committed.contents,
-            })
-        else
-            .unsupported;
+        // The effect can't be null here (checked when the transaction
+        // began) but if an embedder cleared it mid-transaction that's
+        // ENOSYS.
+        const func = self.effects.clipboard_write orelse {
+            self.kittyClipboardFinish(state, .ENOSYS, terminator);
+            return;
+        };
 
-        self.kittyClipboardFinish(state, switch (result) {
-            .success => .DONE,
-            .denied => .EPERM,
-            .unsupported => .ENOSYS,
-            .busy => .EBUSY,
-            .invalid_data => .EINVAL,
-            .io_error, _ => .EIO,
-        }, terminator);
+        // Per the spec a password without a name is no password. A
+        // stored grant for it lets the embedder skip its prompt.
+        const pw: []const u8 = if (committed.name.len > 0) committed.pw else "";
+        const granted = self.kitty_clipboard_grants.use(alloc, pw, .write);
+
+        var reply_state: KittyClipboardWriteReplyState = .{
+            .handler = self,
+            .pw = pw,
+        };
+        func(self, .{
+            .location = committed.loc,
+            .contents = committed.contents,
+            .name = committed.name,
+            .granted = granted,
+            .can_remember = pw.len > 0,
+            .reply_ctx = &reply_state,
+            .reply_fn = &KittyClipboardWriteReplyState.reply,
+        });
+
+        // The program is waiting on the commit status, so a callback
+        // that returned without a reply is answered as a denial rather
+        // than silence.
+        self.kittyClipboardFinish(
+            state,
+            reply_state.status orelse .EPERM,
+            terminator,
+        );
     }
+
+    /// Reply state for one synchronous Kitty clipboard write. This lives
+    /// on the kittyClipboardCommit stack frame, so it is only valid
+    /// during the callback.
+    const KittyClipboardWriteReplyState = struct {
+        handler: *Handler,
+
+        /// The effective password, empty when the request had none.
+        pw: []const u8,
+
+        /// The replied commit status, mapped 1:1 from the reply result;
+        /// null until the callback replies.
+        status: ?kitty_clipboard.Status = null,
+
+        fn reply(ctx: *anyopaque, result: clipboard.Write.Result) void {
+            const self: *KittyClipboardWriteReplyState = @ptrCast(@alignCast(ctx));
+            if (self.status != null) {
+                log.warn("clipboard write replied more than once, ignoring", .{});
+                return;
+            }
+            self.status = switch (result) {
+                .denied => .EPERM,
+                .unsupported => .ENOSYS,
+                .busy => .EBUSY,
+                .invalid_data => .EINVAL,
+                .io_error => .EIO,
+                .success => |success| status: {
+                    // Remembering is only offered when the request
+                    // carried a usable password.
+                    if (success.remember and self.pw.len > 0) {
+                        self.handler.kitty_clipboard_grants.grant(
+                            self.handler.terminal.gpa(),
+                            self.pw,
+                            .write,
+                            false,
+                        ) catch |err| {
+                            log.warn("error recording clipboard grant err={}", .{err});
+                        };
+                    }
+                    break :status .DONE;
+                },
+            };
+        }
+    };
 
     /// Answer a write transaction with its final status and drop it.
     /// The id echoed is the one from the transaction's opening write
@@ -1377,7 +1480,16 @@ pub const Handler = struct {
     }
 
     fn requestMode(self: *Handler, mode: modes.Mode) void {
-        const report = self.terminal.modes.getReport(.fromMode(mode));
+        var report = self.terminal.modes.getReport(.fromMode(mode));
+
+        // Kitty paste events (mode 5522) can't work without a clipboard
+        // read effect, so if that isn't set mark it as unrecognized.
+        if (mode == .kitty_paste_events and
+            self.effects.clipboard_read == null)
+        {
+            report.state = .not_recognized;
+        }
+
         self.sendModeReport(report);
     }
 
@@ -1745,6 +1857,51 @@ pub const Handler = struct {
     }
 };
 
+/// A writer that delivers everything through the write_pty effect:
+/// the buffer as it fills, and data that doesn't fit it directly.
+/// Never fails, since the effect can't.
+const PtyWriter = struct {
+    handler: *Handler,
+    writer: std.Io.Writer,
+
+    fn init(handler: *Handler, buffer: []u8) PtyWriter {
+        return .{
+            .handler = handler,
+            .writer = .{
+                .vtable = &.{ .drain = drain },
+                .buffer = buffer,
+            },
+        };
+    }
+
+    fn drain(
+        w: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        const self: *PtyWriter = @alignCast(@fieldParentPtr("writer", w));
+
+        // Buffered bytes go first to keep the order.
+        if (w.end > 0) {
+            self.handler.writePty(w.buffer[0..w.end]);
+            w.end = 0;
+        }
+
+        var consumed: usize = 0;
+        for (data[0 .. data.len - 1]) |slice| {
+            if (slice.len > 0) self.handler.writePty(slice);
+            consumed += slice.len;
+        }
+
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| {
+            if (pattern.len > 0) self.handler.writePty(pattern);
+            consumed += pattern.len;
+        }
+        return consumed;
+    }
+};
+
 test "resize clears synchronized output on unchanged cell dimensions" {
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
     defer t.deinit(testing.allocator);
@@ -1817,7 +1974,7 @@ test "resize reports mode 2048 geometry" {
         var response: [128]u8 = undefined;
         var response_len: usize = 0;
 
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             @memcpy(response[0..data.len], data);
             response_len = data.len;
         }
@@ -1846,7 +2003,7 @@ test "resize suppresses mode 2048 reports" {
     const S = struct {
         var calls: usize = 0;
 
-        fn writePty(_: *Handler, _: [:0]const u8) void {
+        fn writePty(_: *Handler, _: []const u8) void {
             calls += 1;
         }
     };
@@ -1902,7 +2059,7 @@ test "resize failure preserves terminal state and does not write" {
     const S = struct {
         var called: bool = false;
 
-        fn writePty(_: *Handler, _: [:0]const u8) void {
+        fn writePty(_: *Handler, _: []const u8) void {
             called = true;
         }
     };
@@ -1944,7 +2101,7 @@ test "resize effects do not change canonical terminal state" {
     defer readonly.deinit(testing.allocator);
 
     const S = struct {
-        fn writePty(_: *Handler, _: [:0]const u8) void {}
+        fn writePty(_: *Handler, _: []const u8) void {}
     };
     var authoritative_handler: Handler = .init(&authoritative);
     authoritative_handler.effects.write_pty = &S.writePty;
@@ -2216,7 +2373,7 @@ test "DECRQSS responses" {
             calls = 0;
         }
 
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             @memcpy(response[0..data.len], data);
             response_len = data.len;
             calls += 1;
@@ -2288,7 +2445,7 @@ test "XTGETTCAP responses" {
             calls = 0;
         }
 
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             @memcpy(response[0..data.len], data);
             response_len = data.len;
             calls += 1;
@@ -2370,7 +2527,7 @@ test "XTGETTCAP TN responses" {
             calls = 0;
         }
 
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             @memcpy(response[0..data.len], data);
             response_len = data.len;
             calls += 1;
@@ -2500,7 +2657,7 @@ test "glyph protocol APC with write_pty callback" {
 
     const S = struct {
         var last_response: ?[:0]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             if (last_response) |old| testing.allocator.free(old);
             last_response = testing.allocator.dupeZ(u8, data) catch @panic("OOM");
         }
@@ -2679,7 +2836,7 @@ test "OSC color query responses" {
             last_response = null;
         }
 
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             reset();
             last_response = testing.allocator.dupeZ(u8, data) catch @panic("OOM");
         }
@@ -2830,7 +2987,7 @@ test "kitty color protocol query responses" {
             last_response = null;
         }
 
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             reset();
             last_response = testing.allocator.dupeZ(u8, data) catch @panic("OOM");
         }
@@ -3190,7 +3347,7 @@ test "clipboard_write effect callback" {
 
     const S = struct {
         var count: usize = 0;
-        var result: clipboard.WriteResult = .success;
+        var result: clipboard.Write.Result = .{ .success = .{} };
         var last_location: clipboard.Location = .standard;
         var last_contents_len: usize = 0;
         var last_mime: ?[]u8 = null;
@@ -3204,7 +3361,7 @@ test "clipboard_write effect callback" {
             last_contents_len = 0;
         }
 
-        fn clipboardWrite(_: *Handler, write: clipboard.Write) clipboard.WriteResult {
+        fn clipboardWrite(_: *Handler, write: clipboard.Write) void {
             clearCapture();
             count += 1;
             last_location = write.location;
@@ -3215,7 +3372,7 @@ test "clipboard_write effect callback" {
                 last_data = testing.allocator.dupe(u8, write.contents[0].data) catch
                     @panic("failed to capture clipboard data");
             }
-            return result;
+            write.reply(result);
         }
     };
     S.count = 0;
@@ -3281,9 +3438,9 @@ test "clipboard_write effect callback" {
     try testing.expectEqualStrings("text/plain", S.last_mime.?);
     try testing.expectEqualStrings("fragmented", S.last_data.?);
 
-    // Callback results are intentionally ignored for protocols without a
-    // write acknowledgement. The denied result above did not stop later writes.
-    try testing.expectEqual(clipboard.WriteResult.denied, S.result);
+    // Reply results are intentionally ignored for protocols without a
+    // write acknowledgement. The denied reply above did not stop later writes.
+    try testing.expect(S.result == .denied);
 }
 
 test "clipboard_read effect callback" {
@@ -3305,7 +3462,7 @@ test "clipboard_read effect callback" {
         }} } };
         var reply_twice: bool = false;
 
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             written.appendSlice(testing.allocator, data) catch @panic("OOM");
         }
 
@@ -3407,9 +3564,9 @@ test "clipboard_write allocation failure is ignored" {
     const S = struct {
         var count: usize = 0;
 
-        fn clipboardWrite(_: *Handler, _: clipboard.Write) clipboard.WriteResult {
+        fn clipboardWrite(_: *Handler, write: clipboard.Write) void {
             count += 1;
-            return .success;
+            write.reply(.{ .success = .{} });
         }
     };
     S.count = 0;
@@ -3437,14 +3594,21 @@ test "clipboard_write allocation failure is ignored" {
 const KittyClipboardCapture = struct {
     var responses: [1024]u8 = undefined;
     var responses_len: usize = 0;
+
+    // Write capture. A null write_result returns without replying.
     var write_count: usize = 0;
-    var result: clipboard.WriteResult = .success;
+    var write_result: ?clipboard.Write.Result = .{ .success = .{} };
+    var write_reply_twice: bool = false;
     var last_location: clipboard.Location = .standard;
     var last_contents_len: usize = 0;
     var last_mimes: [8][64]u8 = undefined;
     var last_mime_lens: [8]usize = @splat(0);
     var last_data: [8][256]u8 = undefined;
     var last_data_lens: [8]usize = @splat(0);
+    var last_write_name: [64]u8 = undefined;
+    var last_write_name_len: usize = 0;
+    var last_write_granted: bool = false;
+    var last_write_can_remember: bool = false;
 
     // Read capture. A null read_result returns without replying.
     var read_count: usize = 0;
@@ -3463,11 +3627,15 @@ const KittyClipboardCapture = struct {
     fn reset() void {
         responses_len = 0;
         write_count = 0;
-        result = .success;
+        write_result = .{ .success = .{} };
+        write_reply_twice = false;
         last_location = .standard;
         last_contents_len = 0;
         last_mime_lens = @splat(0);
         last_data_lens = @splat(0);
+        last_write_name_len = 0;
+        last_write_granted = false;
+        last_write_can_remember = false;
         read_count = 0;
         read_result = null;
         read_reply_twice = false;
@@ -3480,12 +3648,12 @@ const KittyClipboardCapture = struct {
         last_read_can_remember = false;
     }
 
-    fn writePty(_: *Handler, data: [:0]const u8) void {
+    fn writePty(_: *Handler, data: []const u8) void {
         @memcpy(responses[responses_len..][0..data.len], data);
         responses_len += data.len;
     }
 
-    fn clipboardWrite(_: *Handler, write: clipboard.Write) clipboard.WriteResult {
+    fn clipboardWrite(_: *Handler, write: clipboard.Write) void {
         write_count += 1;
         last_location = write.location;
         last_contents_len = write.contents.len;
@@ -3495,7 +3663,12 @@ const KittyClipboardCapture = struct {
             last_data_lens[i] = content.data.len;
             @memcpy(last_data[i][0..content.data.len], content.data);
         }
-        return result;
+        last_write_name_len = write.name.len;
+        @memcpy(last_write_name[0..write.name.len], write.name);
+        last_write_granted = write.granted;
+        last_write_can_remember = write.can_remember;
+        if (write_result) |r| write.reply(r);
+        if (write_reply_twice) write.reply(.io_error);
     }
 
     fn clipboardRead(_: *Handler, read: clipboard.Read) void {
@@ -3525,6 +3698,10 @@ const KittyClipboardCapture = struct {
 
     fn readName() []const u8 {
         return last_read_name[0..last_read_name_len];
+    }
+
+    fn writeName() []const u8 {
+        return last_write_name[0..last_write_name_len];
     }
 
     fn mimeAt(i: usize) []const u8 {
@@ -3595,20 +3772,22 @@ test "kitty clipboard write result maps to response status" {
     defer s.deinit();
 
     const cases = [_]struct {
-        result: clipboard.WriteResult,
+        result: ?clipboard.Write.Result,
         response: []const u8,
     }{
-        .{ .result = .success, .response = "\x1B]5522;type=write:status=DONE\x1B\\" },
+        .{ .result = .{ .success = .{} }, .response = "\x1B]5522;type=write:status=DONE\x1B\\" },
         .{ .result = .denied, .response = "\x1B]5522;type=write:status=EPERM\x1B\\" },
         .{ .result = .unsupported, .response = "\x1B]5522;type=write:status=ENOSYS\x1B\\" },
         .{ .result = .busy, .response = "\x1B]5522;type=write:status=EBUSY\x1B\\" },
         .{ .result = .invalid_data, .response = "\x1B]5522;type=write:status=EINVAL\x1B\\" },
         .{ .result = .io_error, .response = "\x1B]5522;type=write:status=EIO\x1B\\" },
+        // No reply at all is a denial rather than silence.
+        .{ .result = null, .response = "\x1B]5522;type=write:status=EPERM\x1B\\" },
     };
 
     for (cases) |case| {
         S.reset();
-        S.result = case.result;
+        S.write_result = case.result;
 
         // An immediately-committed write with no data is a clear.
         s.nextSlice("\x1B]5522;type=write\x1B\\");
@@ -3618,6 +3797,16 @@ test "kitty clipboard write result maps to response status" {
         try testing.expectEqualStrings(case.response, S.responseSlice());
     }
 
+    // A second reply is ignored.
+    S.reset();
+    S.write_reply_twice = true;
+    s.nextSlice("\x1B]5522;type=write\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=write:status=DONE\x1B\\",
+        S.responseSlice(),
+    );
+
     // The response echoes the request terminator, unlike kitty which
     // always uses ST.
     S.reset();
@@ -3626,6 +3815,18 @@ test "kitty clipboard write result maps to response status" {
     try testing.expectEqual(clipboard.Location.primary, S.last_location);
     try testing.expectEqualStrings(
         "\x1B]5522;type=write:status=DONE\x07",
+        S.responseSlice(),
+    );
+
+    // A system without a primary selection answers a loc=primary write
+    // with ENOSYS, echoing the id.
+    S.reset();
+    S.write_result = .unsupported;
+    s.nextSlice("\x1B]5522;type=write:loc=primary:id=p1\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expectEqual(clipboard.Location.primary, S.last_location);
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=write:status=ENOSYS:id=p1\x1B\\",
         S.responseSlice(),
     );
 }
@@ -3851,10 +4052,13 @@ test "kitty clipboard read password grants" {
     var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
     defer s.deinit();
 
+    // Every read requests a data type ("text/plain"): a request with
+    // no data types never consults the grants at all.
+    //
     // pw="secret", name="app": the first request isn't granted but the
     // reply may ask to remember it.
     S.read_result = .{ .success = .{ .remember = true } };
-    s.nextSlice("\x1B]5522;type=read:pw=c2VjcmV0:name=YXBw\x1B\\");
+    s.nextSlice("\x1B]5522;type=read:pw=c2VjcmV0:name=YXBw;dGV4dC9wbGFpbg==\x1B\\");
     try testing.expectEqual(@as(usize, 1), S.read_count);
     try testing.expectEqualStrings("app", S.readName());
     try testing.expect(!S.last_read_granted);
@@ -3862,33 +4066,129 @@ test "kitty clipboard read password grants" {
 
     // The same password is now granted; a different one is not.
     S.read_result = .{ .success = .{} };
-    s.nextSlice("\x1B]5522;type=read:pw=c2VjcmV0:name=YXBw\x1B\\");
+    s.nextSlice("\x1B]5522;type=read:pw=c2VjcmV0:name=YXBw;dGV4dC9wbGFpbg==\x1B\\");
     try testing.expect(S.last_read_granted);
-    s.nextSlice("\x1B]5522;type=read:pw=b3RoZXI=:name=YXBw\x1B\\");
+    s.nextSlice("\x1B]5522;type=read:pw=b3RoZXI=:name=YXBw;dGV4dC9wbGFpbg==\x1B\\");
     try testing.expect(!S.last_read_granted);
     try testing.expect(S.last_read_can_remember);
 
     // A password without a name doesn't count: it is neither granted
     // nor rememberable, even if the reply asks.
     S.read_result = .{ .success = .{ .remember = true } };
-    s.nextSlice("\x1B]5522;type=read:pw=c2VjcmV0\x1B\\");
+    s.nextSlice("\x1B]5522;type=read:pw=c2VjcmV0;dGV4dC9wbGFpbg==\x1B\\");
     try testing.expectEqualStrings("", S.readName());
     try testing.expect(!S.last_read_granted);
     try testing.expect(!S.last_read_can_remember);
-    s.nextSlice("\x1B]5522;type=read:pw=b3RoZXI=\x1B\\");
+    s.nextSlice("\x1B]5522;type=read:pw=b3RoZXI=;dGV4dC9wbGFpbg==\x1B\\");
     try testing.expect(!S.last_read_can_remember);
     S.read_result = .{ .success = .{} };
-    s.nextSlice("\x1B]5522;type=read:pw=b3RoZXI=:name=YXBw\x1B\\");
+    s.nextSlice("\x1B]5522;type=read:pw=b3RoZXI=:name=YXBw;dGV4dC9wbGFpbg==\x1B\\");
     try testing.expect(!S.last_read_granted);
 
     // A grant is advisory: the request is still forwarded and the
     // embedder may deny it.
     S.responses_len = 0;
     S.read_result = .denied;
-    s.nextSlice("\x1B]5522;type=read:id=d:pw=c2VjcmV0:name=YXBw\x1B\\");
+    s.nextSlice("\x1B]5522;type=read:id=d:pw=c2VjcmV0:name=YXBw;dGV4dC9wbGFpbg==\x1B\\");
     try testing.expect(S.last_read_granted);
     try testing.expectEqualStrings(
         "\x1B]5522;type=read:status=EPERM:id=d\x1B\\",
+        S.responseSlice(),
+    );
+
+    // Grants are freed with the stream (the testing allocator catches
+    // the leak otherwise).
+}
+
+test "kitty clipboard read targets-only never consumes a one-time grant" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // A one-time read grant, as minted for a paste event.
+    try s.handler.kitty_clipboard_grants.grant(testing.allocator, "otp", .read, true);
+
+    // A targets-only read (payload ".") is prompt-exempt so it never
+    // consults, and must not burn, the one-time password.
+    S.read_result = .{ .success = .{} };
+    s.nextSlice("\x1B]5522;type=read:pw=b3Rw:name=YXBw;Lg==\x1B\\");
+    try testing.expectEqual(@as(usize, 1), S.read_count);
+    try testing.expect(S.last_read_list);
+    try testing.expectEqual(@as(usize, 0), S.last_read_mimes_len);
+    try testing.expect(!S.last_read_granted);
+
+    // The follow-up data read still consumes the grant, exactly once.
+    s.nextSlice("\x1B]5522;type=read:pw=b3Rw:name=YXBw;dGV4dC9wbGFpbg==\x1B\\");
+    try testing.expect(S.last_read_granted);
+    s.nextSlice("\x1B]5522;type=read:pw=b3Rw:name=YXBw;dGV4dC9wbGFpbg==\x1B\\");
+    try testing.expect(!S.last_read_granted);
+}
+
+test "kitty clipboard write password grants" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_write = &S.clipboardWrite;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // pw="secret", name="app": the first commit isn't granted but the
+    // reply may ask to remember it.
+    S.write_result = .{ .success = .{ .remember = true } };
+    s.nextSlice("\x1B]5522;type=write:pw=c2VjcmV0:name=YXBw\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expectEqual(@as(usize, 1), S.write_count);
+    try testing.expectEqualStrings("app", S.writeName());
+    try testing.expect(!S.last_write_granted);
+    try testing.expect(S.last_write_can_remember);
+
+    // The same password is now granted; a different one is not.
+    S.write_result = .{ .success = .{} };
+    s.nextSlice("\x1B]5522;type=write:pw=c2VjcmV0:name=YXBw\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expect(S.last_write_granted);
+    s.nextSlice("\x1B]5522;type=write:pw=b3RoZXI=:name=YXBw\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expect(!S.last_write_granted);
+    try testing.expect(S.last_write_can_remember);
+
+    // Directions are independent: a write grant doesn't satisfy reads.
+    S.read_result = .{ .success = .{} };
+    s.nextSlice("\x1B]5522;type=read:pw=c2VjcmV0:name=YXBw\x1B\\");
+    try testing.expect(!S.last_read_granted);
+
+    // A password without a name doesn't count: it is neither granted
+    // nor rememberable, even if the reply asks.
+    S.write_result = .{ .success = .{ .remember = true } };
+    s.nextSlice("\x1B]5522;type=write:pw=c2VjcmV0\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expectEqualStrings("", S.writeName());
+    try testing.expect(!S.last_write_granted);
+    try testing.expect(!S.last_write_can_remember);
+
+    // A grant is advisory: the request is still forwarded and the
+    // embedder may deny it.
+    S.responses_len = 0;
+    S.write_result = .denied;
+    s.nextSlice("\x1B]5522;type=write:id=d:pw=c2VjcmV0:name=YXBw\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expect(S.last_write_granted);
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=write:status=EPERM:id=d\x1B\\",
         S.responseSlice(),
     );
 
@@ -3956,7 +4256,7 @@ test "kitty clipboard new write replaces in-flight transaction" {
     );
 }
 
-test "kitty clipboard invalid walias payload aborts with EINVAL" {
+test "kitty clipboard invalid write packets abort with EINVAL" {
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
     defer t.deinit(testing.allocator);
 
@@ -3969,20 +4269,103 @@ test "kitty clipboard invalid walias payload aborts with EINVAL" {
     var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
     defer s.deinit();
 
+    const invalid_packets = [_][]const u8{
+        // Alias payload decodes to a non-UTF-8 byte.
+        "\x1B]5522;type=walias:mime=dGV4dC9wbGFpbg==;/w==\x1B\\",
+        // Alias has no target MIME type.
+        "\x1B]5522;type=walias;VEVYVA==\x1B\\",
+        // Alias target MIME decodes to non-UTF-8 bytes.
+        "\x1B]5522;type=walias:mime=//4=;VEVYVA==\x1B\\",
+        // Write data MIME decodes to non-UTF-8 bytes.
+        "\x1B]5522;type=wdata:mime=//4=;R2hvc3Q=\x1B\\",
+    };
+
+    for (invalid_packets) |packet| {
+        S.responses_len = 0;
+        s.nextSlice("\x1B]5522;type=write:id=w\x1B\\");
+        s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\");
+        s.nextSlice(packet);
+        try testing.expectEqualStrings(
+            "\x1B]5522;type=write:status=EINVAL:id=w\x1B\\",
+            S.responseSlice(),
+        );
+        try testing.expect(!s.handler.semantic_failure);
+
+        // The transaction is gone: a commit does nothing further.
+        s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+        try testing.expectEqual(@as(usize, 0), S.write_count);
+        try testing.expectEqualStrings(
+            "\x1B]5522;type=write:status=EINVAL:id=w\x1B\\",
+            S.responseSlice(),
+        );
+    }
+}
+
+test "kitty clipboard invalid read text does not abort a write" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+    S.read_result = .{ .success = .{} };
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    handler.effects.clipboard_write = &S.clipboardWrite;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
     s.nextSlice("\x1B]5522;type=write:id=w\x1B\\");
     s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\");
-    s.nextSlice("\x1B]5522;type=walias:mime=dGV4dC9wbGFpbg==;!!!\x1B\\");
+
+    // The read payload decodes to a non-UTF-8 byte. It is dropped without
+    // invoking the clipboard effect or disturbing the write transaction.
+    s.nextSlice("\x1B]5522;type=read;/w==\x1B\\");
+    try testing.expectEqual(@as(usize, 0), S.read_count);
+    try testing.expectEqual(@as(usize, 0), S.responses_len);
+
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expectEqual(@as(usize, 1), S.write_count);
     try testing.expectEqualStrings(
-        "\x1B]5522;type=write:status=EINVAL:id=w\x1B\\",
+        "\x1B]5522;type=write:status=DONE:id=w\x1B\\",
+        S.responseSlice(),
+    );
+}
+
+test "kitty clipboard oversized text write aborts with EFBIG" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_write = &S.clipboardWrite;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // Shrink the limit so the test doesn't have to stream the
+    // default 64MiB.
+    s.handler.kitty_clipboard_write_max_bytes = 4;
+
+    s.nextSlice("\x1B]5522;type=write:id=w\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;SGVsbA==\x1B\\"); // "Hell"
+    try testing.expectEqual(@as(usize, 0), S.responses_len);
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;bw==\x1B\\"); // "o"
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=write:status=EFBIG:id=w\x1B\\",
         S.responseSlice(),
     );
     try testing.expect(!s.handler.semantic_failure);
 
-    // The transaction is gone: a commit does nothing further.
+    // The transaction is gone: later data and the commit do nothing.
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;IQ==\x1B\\");
     s.nextSlice("\x1B]5522;type=wdata\x1B\\");
     try testing.expectEqual(@as(usize, 0), S.write_count);
     try testing.expectEqualStrings(
-        "\x1B]5522;type=write:status=EINVAL:id=w\x1B\\",
+        "\x1B]5522;type=write:status=EFBIG:id=w\x1B\\",
         S.responseSlice(),
     );
 }
@@ -4108,7 +4491,7 @@ test "request mode DECRQM with write_pty callback" {
     {
         const S = struct {
             var last_response: ?[:0]const u8 = null;
-            fn writePty(_: *Handler, data: [:0]const u8) void {
+            fn writePty(_: *Handler, data: []const u8) void {
                 if (last_response) |old| testing.allocator.free(old);
                 last_response = testing.allocator.dupeZ(u8, data) catch @panic("OOM");
             }
@@ -4232,7 +4615,7 @@ test "kitty_keyboard_query" {
     const S = struct {
         var written: ?[]const u8 = null;
         var written_buf: [64]u8 = undefined;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             std.debug.assert(data.len <= written_buf.len);
             @memcpy(written_buf[0..data.len], data);
             written = written_buf[0..data.len];
@@ -4264,7 +4647,7 @@ test "xtversion default" {
     const S = struct {
         var written: ?[]const u8 = null;
         var written_buf: [64]u8 = undefined;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             std.debug.assert(data.len <= written_buf.len);
             @memcpy(written_buf[0..data.len], data);
             written = written_buf[0..data.len];
@@ -4290,7 +4673,7 @@ test "xtversion with effect" {
     const S = struct {
         var written: ?[]const u8 = null;
         var written_buf: [64]u8 = undefined;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             std.debug.assert(data.len <= written_buf.len);
             @memcpy(written_buf[0..data.len], data);
             written = written_buf[0..data.len];
@@ -4319,7 +4702,7 @@ test "xtversion with empty string effect" {
     const S = struct {
         var written: ?[]const u8 = null;
         var written_buf: [64]u8 = undefined;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             std.debug.assert(data.len <= written_buf.len);
             @memcpy(written_buf[0..data.len], data);
             written = written_buf[0..data.len];
@@ -4348,7 +4731,7 @@ test "size report csi_14_t with effect" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
         fn getSize(_: *Handler) ?size_report.Size {
@@ -4379,7 +4762,7 @@ test "mode 2048 enable reports current geometry and disable is silent" {
         var response_len: usize = 0;
         var calls: usize = 0;
 
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             @memcpy(response[0..data.len], data);
             response_len = data.len;
             calls += 1;
@@ -4414,7 +4797,7 @@ test "mode 2048 enable tolerates missing effects" {
     const S = struct {
         var calls: usize = 0;
 
-        fn writePty(_: *Handler, _: [:0]const u8) void {
+        fn writePty(_: *Handler, _: []const u8) void {
             calls += 1;
         }
 
@@ -4467,7 +4850,7 @@ test "size report csi_16_t with effect" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
         fn getSize(_: *Handler) ?size_report.Size {
@@ -4495,7 +4878,7 @@ test "size report csi_18_t with effect" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
         fn getSize(_: *Handler) ?size_report.Size {
@@ -4523,7 +4906,7 @@ test "size report no effect callback" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
     };
@@ -4546,7 +4929,7 @@ test "size report csi_21_t title disabled by default" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
     };
@@ -4572,7 +4955,7 @@ test "size report csi_21_t title enabled" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
     };
@@ -4600,7 +4983,7 @@ test "enquiry no effect" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
     };
@@ -4623,7 +5006,7 @@ test "enquiry with effect" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
         fn enquiry(_: *Handler) []const u8 {
@@ -4650,7 +5033,7 @@ test "enquiry with empty response" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
         fn enquiry(_: *Handler) []const u8 {
@@ -4677,7 +5060,7 @@ test "device status: operating status" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             if (written) |old| testing.allocator.free(old);
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
@@ -4702,7 +5085,7 @@ test "device status: cursor position" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             if (written) |old| testing.allocator.free(old);
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
@@ -4732,7 +5115,7 @@ test "device status: cursor position with origin mode" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             if (written) |old| testing.allocator.free(old);
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
@@ -4764,7 +5147,7 @@ test "device status: color scheme dark" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             if (written) |old| testing.allocator.free(old);
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
@@ -4793,7 +5176,7 @@ test "device status: color scheme light" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             if (written) |old| testing.allocator.free(old);
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
@@ -4822,7 +5205,7 @@ test "device status: color scheme without callback" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             if (written) |old| testing.allocator.free(old);
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
@@ -4849,7 +5232,7 @@ test "visibility reports" {
         var written: ?[]const u8 = null;
         var count: usize = 0;
 
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             if (written) |old| testing.allocator.free(old);
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
             count += 1;
@@ -4918,7 +5301,7 @@ test "device attributes: primary DA" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             if (written) |old| testing.allocator.free(old);
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
@@ -4946,7 +5329,7 @@ test "device attributes: secondary DA" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             if (written) |old| testing.allocator.free(old);
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
@@ -4974,7 +5357,7 @@ test "device attributes: tertiary DA" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             if (written) |old| testing.allocator.free(old);
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
@@ -5021,7 +5404,7 @@ test "device attributes: custom response" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             if (written) |old| testing.allocator.free(old);
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
@@ -5063,7 +5446,7 @@ test "kitty graphics APC response" {
 
     const S = struct {
         var written: ?[]const u8 = null;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             if (written) |old| testing.allocator.free(old);
             written = testing.allocator.dupe(u8, data) catch @panic("OOM");
         }
@@ -5120,7 +5503,7 @@ test "continuation reconstructs standard stream without duplicate effects" {
             title_count += 1;
         }
 
-        fn writePty(_: *Handler, _: [:0]const u8) void {
+        fn writePty(_: *Handler, _: []const u8) void {
             write_count += 1;
         }
 
@@ -5133,10 +5516,10 @@ test "continuation reconstructs standard stream without duplicate effects" {
 
         fn clipboardWrite(
             _: *Handler,
-            _: clipboard.Write,
-        ) clipboard.WriteResult {
+            write: clipboard.Write,
+        ) void {
             clipboard_count += 1;
-            return .success;
+            write.reply(.{ .success = .{} });
         }
 
         fn reset() void {
@@ -5257,7 +5640,7 @@ test "continuation reconstructs standard stream without duplicate effects" {
 test "kitty dnd: query response" {
     const S = struct {
         var pty: std.ArrayListUnmanaged(u8) = .empty;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             pty.appendSlice(testing.allocator, data) catch unreachable;
         }
     };
@@ -5279,7 +5662,7 @@ test "kitty dnd: query response" {
 test "kitty dnd: register, drop, and serve data" {
     const S = struct {
         var pty: std.ArrayListUnmanaged(u8) = .empty;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             pty.appendSlice(testing.allocator, data) catch unreachable;
         }
     };
@@ -5355,7 +5738,7 @@ test "kitty dnd: state updates work without write_pty effect" {
 test "kitty dnd: registration survives terminal reset" {
     const S = struct {
         var pty: std.ArrayListUnmanaged(u8) = .empty;
-        fn writePty(_: *Handler, data: [:0]const u8) void {
+        fn writePty(_: *Handler, data: []const u8) void {
             pty.appendSlice(testing.allocator, data) catch unreachable;
         }
     };
@@ -5480,7 +5863,7 @@ const PasteCapture = struct {
         written = .empty;
     }
 
-    fn writePty(_: *Handler, data: [:0]const u8) void {
+    fn writePty(_: *Handler, data: []const u8) void {
         written.appendSlice(testing.allocator, data) catch @panic("OOM");
         write_count += 1;
     }
@@ -5509,7 +5892,7 @@ test "paste: no write_pty effect is an error" {
     var handler: Handler = .init(&t);
     defer handler.deinit();
     try testing.expectError(error.NoWritePty, handler.paste(.{
-        .contents = &.{.{ .mime = "text/plain", .data = "hello" }},
+        .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = "hello" }} },
     }));
 }
 
@@ -5527,7 +5910,7 @@ test "paste: plain text converts newlines and strips unsafe bytes" {
 
     // Newlines are unsafe unbracketed; the embedder confirmed.
     try testing.expect(try handler.paste(.{
-        .contents = &.{.{ .mime = "text/plain", .data = "hel\x1blo\nwor\x00ld" }},
+        .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = "hel\x1blo\nwor\x00ld" }} },
         .allow_unsafe = true,
     }));
     try testing.expectEqualStrings("hel lo\rwor ld", S.written.items);
@@ -5536,11 +5919,11 @@ test "paste: plain text converts newlines and strips unsafe bytes" {
     // The first text representation is used; others are ignored.
     S.reset();
     try testing.expect(try handler.paste(.{
-        .contents = &.{
+        .contents = .{ .memory = &.{
             .{ .mime = "image/png", .data = "\x89PNG" },
             .{ .mime = "UTF8_STRING", .data = "hi" },
             .{ .mime = "text/plain", .data = "ignored" },
-        },
+        } },
     }));
     try testing.expectEqualStrings("hi", S.written.items);
     try testing.expectEqual(@as(usize, 1), S.write_count);
@@ -5559,12 +5942,12 @@ test "paste: unsafe text is refused unless allowed" {
     handler.effects.write_pty = &S.writePty;
 
     try testing.expectError(error.UnsafePaste, handler.paste(.{
-        .contents = &.{.{ .mime = "text/plain", .data = "rm -rf /\n" }},
+        .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = "rm -rf /\n" }} },
     }));
     try testing.expectEqual(@as(usize, 0), S.write_count);
 
     try testing.expect(try handler.paste(.{
-        .contents = &.{.{ .mime = "text/plain", .data = "rm -rf /\n" }},
+        .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = "rm -rf /\n" }} },
         .allow_unsafe = true,
     }));
     try testing.expectEqualStrings("rm -rf /\r", S.written.items);
@@ -5585,7 +5968,7 @@ test "paste: bracketed paste frames the text" {
 
     // Newlines are safe inside the frame and are preserved.
     try testing.expect(try handler.paste(.{
-        .contents = &.{.{ .mime = "text/plain", .data = "hello\nworld" }},
+        .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = "hello\nworld" }} },
     }));
     try testing.expectEqualStrings("\x1b[200~hello\nworld\x1b[201~", S.written.items);
     try testing.expectEqual(@as(usize, 1), S.write_count);
@@ -5593,13 +5976,13 @@ test "paste: bracketed paste frames the text" {
     // The frame terminator is not.
     S.reset();
     try testing.expectError(error.UnsafePaste, handler.paste(.{
-        .contents = &.{.{ .mime = "text/plain", .data = "he\x1b[201~llo" }},
+        .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = "he\x1b[201~llo" }} },
     }));
     try testing.expectEqual(@as(usize, 0), S.write_count);
 
     // Allowed, the stripper still defuses it: ESC becomes a space.
     try testing.expect(try handler.paste(.{
-        .contents = &.{.{ .mime = "text/plain", .data = "he\x1b[201~llo" }},
+        .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = "he\x1b[201~llo" }} },
         .allow_unsafe = true,
     }));
     try testing.expectEqualStrings("\x1b[200~he [201~llo\x1b[201~", S.written.items);
@@ -5618,18 +6001,18 @@ test "paste: no text representation writes nothing" {
     handler.effects.write_pty = &S.writePty;
 
     try testing.expect(!try handler.paste(.{
-        .contents = &.{.{ .mime = "image/png", .data = "\x89PNG" }},
+        .contents = .{ .memory = &.{.{ .mime = "image/png", .data = "\x89PNG" }} },
     }));
     try testing.expect(!try handler.paste(.{
-        .contents = &.{},
+        .contents = .{ .memory = &.{} },
     }));
     try testing.expect(!try handler.paste(.{
-        .contents = &.{.{ .mime = "text/plain", .data = "" }},
+        .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = "" }} },
     }));
     try testing.expectEqual(@as(usize, 0), S.write_count);
 }
 
-test "paste: large text falls back to the heap in one write" {
+test "paste: large text streams to the pty in chunks" {
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
     defer t.deinit(testing.allocator);
 
@@ -5642,14 +6025,156 @@ test "paste: large text falls back to the heap in one write" {
     handler.effects.write_pty = &S.writePty;
     t.modes.set(.bracketed_paste, true);
 
+    // Two full chunks and a partial one with the frame, never the
+    // whole thing at once.
     const data = "x" ** 10_000;
     try testing.expect(try handler.paste(.{
-        .contents = &.{.{ .mime = "text/plain", .data = data }},
+        .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = data }} },
     }));
-    try testing.expectEqual(@as(usize, 1), S.write_count);
-    try testing.expectEqual(data.len + "\x1b[200~\x1b[201~".len, S.written.items.len);
+    const total = data.len + "\x1b[200~\x1b[201~".len;
+    try testing.expectEqual(
+        @as(usize, (total + Handler.paste_chunk_size - 1) / Handler.paste_chunk_size),
+        S.write_count,
+    );
+    try testing.expectEqual(total, S.written.items.len);
     try testing.expect(std.mem.startsWith(u8, S.written.items, "\x1b[200~xxx"));
     try testing.expect(std.mem.endsWith(u8, S.written.items, "xxx\x1b[201~"));
+}
+
+/// A paste contents reader for the tests: serves fixed data per MIME
+/// type in pieces, counting the reads of each representation.
+const PasteReader = struct {
+    mimes: []const []const u8,
+    data: []const []const u8,
+    piece: usize = 3,
+    reads: [4]usize = @splat(0),
+    /// Fail after this many bytes of a read.
+    fail_after: ?usize = null,
+
+    fn contents(self: *PasteReader) paste_pkg.Contents {
+        return .{ .reader = .{
+            .mimes = self.mimes,
+            .read = .{ .ctx = self, .read_fn = &read },
+        } };
+    }
+
+    fn read(ctx: ?*anyopaque, mime: []const u8, sink: *std.Io.Writer) clipboard.MimeReader.Error!void {
+        const self: *PasteReader = @ptrCast(@alignCast(ctx.?));
+        const index: usize = for (self.mimes, 0..) |m, i| {
+            if (std.mem.eql(u8, m, mime)) break i;
+        } else return error.ReadFailed;
+        self.reads[index] += 1;
+        const data = self.data[index];
+        var offset: usize = 0;
+        while (offset < data.len) {
+            if (self.fail_after) |limit| if (offset >= limit) return error.ReadFailed;
+            const n = @min(self.piece, data.len - offset);
+            try sink.writeAll(data[offset..][0..n]);
+            offset += n;
+        }
+    }
+};
+
+test "paste: reader contents are read on demand" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = PasteCapture;
+    S.reset();
+    defer S.deinit();
+
+    var handler: Handler = .init(&t);
+    defer handler.deinit();
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+
+    // Unsafe text is refused from one read with nothing written; the
+    // image is never read.
+    var reader: PasteReader = .{
+        .mimes = &.{ "image/png", "text/plain" },
+        .data = &.{ "\x89PNG", "echo hi\nrm -rf /\n" },
+    };
+    try testing.expectError(error.UnsafePaste, handler.paste(.{
+        .contents = reader.contents(),
+    }));
+    try testing.expectEqual(@as(usize, 0), S.write_count);
+    try testing.expectEqual(@as(usize, 0), reader.reads[0]);
+    try testing.expectEqual(@as(usize, 1), reader.reads[1]);
+
+    // Allowed, the text is read once, encoded.
+    reader.reads = @splat(0);
+    try testing.expect(try handler.paste(.{
+        .contents = reader.contents(),
+        .allow_unsafe = true,
+    }));
+    try testing.expectEqualStrings("echo hi\rrm -rf /\r", S.written.items);
+    try testing.expectEqual(@as(usize, 0), reader.reads[0]);
+    try testing.expectEqual(@as(usize, 1), reader.reads[1]);
+
+    // Safe text is read once too: buffered for the check, then written.
+    S.reset();
+    reader = .{
+        .mimes = &.{"text/plain"},
+        .data = &.{"hello world"},
+    };
+    try testing.expect(try handler.paste(.{ .contents = reader.contents() }));
+    try testing.expectEqualStrings("hello world", S.written.items);
+    try testing.expectEqual(@as(usize, 1), reader.reads[0]);
+
+    // Empty text is nothing to paste, found on the one read.
+    S.reset();
+    reader = .{
+        .mimes = &.{"text/plain"},
+        .data = &.{""},
+    };
+    try testing.expect(!try handler.paste(.{ .contents = reader.contents() }));
+    try testing.expectEqual(@as(usize, 0), S.write_count);
+    try testing.expectEqual(@as(usize, 1), reader.reads[0]);
+
+    // A paste event lists the types and reads nothing at all.
+    S.reset();
+    t.modes.set(.kitty_paste_events, true);
+    reader = .{
+        .mimes = &.{ "text/plain", "image/png" },
+        .data = &.{ "secret", "\x89PNG" },
+    };
+    try testing.expect(try handler.paste(.{ .contents = reader.contents() }));
+    try testing.expect(std.mem.indexOf(u8, S.written.items, ";dGV4dC9wbGFpbiBpbWFnZS9wbmcK\x1b\\") != null);
+    try testing.expect(std.mem.indexOf(u8, S.written.items, "secret") == null);
+    try testing.expectEqual(@as(usize, 0), reader.reads[0]);
+    try testing.expectEqual(@as(usize, 0), reader.reads[1]);
+}
+
+test "paste: reader failure writes nothing" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = PasteCapture;
+    S.reset();
+    defer S.deinit();
+
+    var handler: Handler = .init(&t);
+    defer handler.deinit();
+    handler.effects.write_pty = &S.writePty;
+    t.modes.set(.bracketed_paste, true);
+
+    // The read is buffered whole before anything is written, so a
+    // mid-read failure discards the buffer, checked or not.
+    var reader: PasteReader = .{
+        .mimes = &.{"text/plain"},
+        .data = &.{"hello world"},
+        .fail_after = 6,
+    };
+    try testing.expectError(error.ReadFailed, handler.paste(.{
+        .contents = reader.contents(),
+    }));
+    try testing.expectEqual(@as(usize, 0), S.write_count);
+
+    try testing.expectError(error.ReadFailed, handler.paste(.{
+        .contents = reader.contents(),
+        .allow_unsafe = true,
+    }));
+    try testing.expectEqual(@as(usize, 0), S.write_count);
 }
 
 test "paste: mode 5522 sends an event the program can read with" {
@@ -5671,10 +6196,10 @@ test "paste: mode 5522 sends an event the program can read with" {
     // Every representation is listed, the data is never written, and
     // the one-time password rides on every packet.
     try testing.expect(try s.handler.paste(.{
-        .contents = &.{
+        .contents = .{ .memory = &.{
             .{ .mime = "text/plain", .data = "secret" },
             .{ .mime = "image/png", .data = "" },
-        },
+        } },
     }));
     try testing.expectEqual(@as(usize, 1), S.write_count);
     try testing.expectEqual(@as(usize, 3), std.mem.count(u8, S.written.items, "\x1b]5522;"));
@@ -5735,7 +6260,7 @@ test "paste: mode 5522 sends an event the program can read with" {
     // Every event mints a fresh password.
     S.reset();
     try testing.expect(try s.handler.paste(.{
-        .contents = &.{.{ .mime = "text/plain", .data = "secret" }},
+        .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = "secret" }} },
     }));
     try testing.expect(std.mem.indexOf(u8, S.written.items, pw_b64) == null);
 }
@@ -5757,8 +6282,8 @@ test "paste: mode 5522 reports the selection as primary" {
     for ([_]clipboard.Location{ .primary, .selection }) |location| {
         S.reset();
         try testing.expect(try handler.paste(.{
-            .location = location,
-            .contents = &.{.{ .mime = "text/plain", .data = "x" }},
+            .source = .{ .clipboard = location },
+            .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = "x" }} },
         }));
         try testing.expect(std.mem.startsWith(
             u8,
@@ -5771,8 +6296,8 @@ test "paste: mode 5522 reports the selection as primary" {
 
     S.reset();
     try testing.expect(try handler.paste(.{
-        .location = .standard,
-        .contents = &.{.{ .mime = "text/plain", .data = "x" }},
+        .source = .{ .clipboard = .standard },
+        .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = "x" }} },
     }));
     try testing.expect(std.mem.indexOf(u8, S.written.items, "loc=") == null);
 }
@@ -5791,7 +6316,7 @@ test "paste: mode 5522 without clipboard_read pastes text" {
     t.modes.set(.kitty_paste_events, true);
 
     try testing.expect(try handler.paste(.{
-        .contents = &.{.{ .mime = "text/plain", .data = "hello" }},
+        .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = "hello" }} },
     }));
     try testing.expectEqualStrings("hello", S.written.items);
     try testing.expectEqual(@as(usize, 0), handler.kitty_clipboard_grants.entries.items.len);
@@ -5813,7 +6338,7 @@ test "paste: text source never becomes an event" {
 
     try testing.expect(try handler.paste(.{
         .source = .text,
-        .contents = &.{.{ .mime = "text/plain", .data = "committed" }},
+        .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = "committed" }} },
     }));
     try testing.expectEqualStrings("committed", S.written.items);
     try testing.expectEqual(@as(usize, 0), handler.kitty_clipboard_grants.entries.items.len);
@@ -5834,7 +6359,7 @@ test "paste: mode 5522 without entropy fails and records no grant" {
     t.modes.set(.kitty_paste_events, true);
 
     try testing.expectError(error.EntropyUnavailable, handler.paste(.{
-        .contents = &.{.{ .mime = "text/plain", .data = "secret" }},
+        .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = "secret" }} },
     }));
     try testing.expectEqual(@as(usize, 0), S.write_count);
     try testing.expectEqual(@as(usize, 0), handler.kitty_clipboard_grants.entries.items.len);
@@ -5842,12 +6367,12 @@ test "paste: mode 5522 without entropy fails and records no grant" {
     // Text pastes need no entropy and still work.
     try testing.expect(try handler.paste(.{
         .source = .text,
-        .contents = &.{.{ .mime = "text/plain", .data = "hello" }},
+        .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = "hello" }} },
     }));
     try testing.expectEqualStrings("hello", S.written.items);
 }
 
-test "paste: mode 5522 is settable and reported in the lib build" {
+test "paste: mode 5522 DECRQM requires clipboard read effect" {
     if (comptime build_options.artifact != .lib) return error.SkipZigTest;
 
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
@@ -5862,18 +6387,34 @@ test "paste: mode 5522 is settable and reported in the lib build" {
     var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
     defer s.deinit();
 
-    // Recognized and reset by default, so programs can detect support.
+    // A paste event is unusable if its follow-up read can't be served, so
+    // the mode isn't advertised without a clipboard read effect.
     s.nextSlice("\x1B[?5522$p");
-    try testing.expectEqualStrings("\x1B[?5522;2$y", S.written.items);
+    try testing.expectEqualStrings("\x1B[?5522;0$y", S.written.items);
 
     S.reset();
     s.nextSlice("\x1B[?5522h");
     try testing.expect(t.modes.get(.kitty_paste_events));
     s.nextSlice("\x1B[?5522$p");
+    try testing.expectEqualStrings("\x1B[?5522;0$y", S.written.items);
+
+    // Installing the effect makes the current mode state reportable.
+    S.reset();
+    s.handler.effects.clipboard_read = &S.clipboardRead;
+    s.nextSlice("\x1B[?5522$p");
     try testing.expectEqualStrings("\x1B[?5522;1$y", S.written.items);
 
+    S.reset();
     s.nextSlice("\x1B[?5522l");
     try testing.expect(!t.modes.get(.kitty_paste_events));
+    s.nextSlice("\x1B[?5522$p");
+    try testing.expectEqualStrings("\x1B[?5522;2$y", S.written.items);
+
+    // Removing the effect stops advertising the capability again.
+    S.reset();
+    s.handler.effects.clipboard_read = null;
+    s.nextSlice("\x1B[?5522$p");
+    try testing.expectEqualStrings("\x1B[?5522;0$y", S.written.items);
 }
 
 test "full reset drops kitty clipboard grants" {

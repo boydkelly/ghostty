@@ -31,18 +31,7 @@ jobs:
       - name: Merge main into nightly
         run: |
           git checkout -B nightly origin/nightly
-          if ! git merge upstream/main --no-edit; then
-            git checkout --theirs .github/workflows/release-tip.yml
-            git add .github/workflows/release-tip.yml
-            git commit --no-edit
-          fi
+          git merge upstream/main --no-edit
           git push origin nightly --force
           git tag -f tip HEAD
           git push origin tip --force
-    # - name: Merge main into nightly
-    #   run: |
-    #     git checkout -B nightly origin/nightly
-    #     git merge upstream/main --no-edit
-    #     git push origin nightly --force
-    #     git tag -f tip HEAD
-    #     git push origin tip --force

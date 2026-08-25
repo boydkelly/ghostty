@@ -18,7 +18,6 @@ const formatter_pkg = @import("../formatter.zig");
 const modes_pkg = @import("../modes.zig");
 const mouse_pkg = @import("../mouse.zig");
 const page = @import("../page.zig");
-const paste_pkg = @import("../paste.zig");
 const point = @import("../point.zig");
 const Selection = @import("../Selection.zig");
 const sgr = @import("../sgr.zig");
@@ -179,6 +178,7 @@ const type_decls = [_]TypeDecl{
     .initStruct("GhosttyClipboardRead", terminal.ClipboardRead),
     .initStruct("GhosttyClipboardReadReply", terminal.ClipboardReadReply),
     .initStruct("GhosttyClipboardWrite", terminal.ClipboardWrite),
+    .initStruct("GhosttyClipboardWriteReply", terminal.ClipboardWriteReply),
     .initStruct("GhosttyCodepoints", Codepoints),
     .initStruct("GhosttyColorPaletteMask", color_c.PaletteMask),
     .initStruct("GhosttyColorRgb", color.RGB.C),
@@ -192,6 +192,7 @@ const type_decls = [_]TypeDecl{
     .initStruct("GhosttyFormatterTerminalOptions", formatter.TerminalOptions),
     .initStruct("GhosttyGridRef", grid_ref.CGridRef),
     .initStruct("GhosttyKittyGraphicsPlacementRenderInfo", kitty_graphics.PlacementRenderInfo),
+    .initStruct("GhosttyMimeReader", io.MimeReader),
     .initStruct("GhosttyMouseEncoderSize", mouse_encode.Size),
     .initStruct("GhosttyMousePosition", mouse_event.Position),
     .initStruct("GhosttyPaste", paste.Request),
@@ -247,7 +248,7 @@ const type_decls = [_]TypeDecl{
     .initEnum("GhosttyCellWide", cell.Wide, "GHOSTTY_CELL_WIDE_"),
     .initEnum("GhosttyClipboardLocation", clipboard.Location, "GHOSTTY_CLIPBOARD_LOCATION_"),
     .initEnum("GhosttyClipboardReadResult", clipboard.Read.Status, "GHOSTTY_CLIPBOARD_READ_RESULT_"),
-    .initEnum("GhosttyClipboardWriteResult", clipboard.WriteResult, "GHOSTTY_CLIPBOARD_WRITE_RESULT_"),
+    .initEnum("GhosttyClipboardWriteResult", clipboard.Write.Status, "GHOSTTY_CLIPBOARD_WRITE_RESULT_"),
     .initEnum("GhosttyColorScheme", device_status.ColorScheme, "GHOSTTY_COLOR_SCHEME_"),
     .initEnum("GhosttyFocusEvent", focus_pkg.Event, "GHOSTTY_FOCUS_"),
     .initEnum("GhosttyFormatterFormat", formatter_pkg.Format, "GHOSTTY_FORMATTER_FORMAT_"),
@@ -275,7 +276,7 @@ const type_decls = [_]TypeDecl{
         "GHOSTTY_OSC_COMMAND_",
         "TYPE_MAX_VALUE",
     ),
-    .initEnum("GhosttyPasteSource", paste_pkg.Source, "GHOSTTY_PASTE_SOURCE_"),
+    .initEnum("GhosttyPasteSource", paste.Source, "GHOSTTY_PASTE_SOURCE_"),
     .initEnum("GhosttyPointTag", point.Tag, "GHOSTTY_POINT_TAG_"),
     .initEnum("GhosttyRenderStateCursorVisualStyle", render.CursorVisualStyle, "GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_"),
     .initEnum("GhosttyRenderStateData", render.Data, "GHOSTTY_RENDER_STATE_DATA_"),
