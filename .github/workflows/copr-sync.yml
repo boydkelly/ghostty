@@ -17,7 +17,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config merge.ours.driver true
       - name: Add upstream and fetch (no tags)
         run: |
           git remote add upstream https://github.com/ghostty-org/ghostty.git
@@ -32,7 +31,7 @@ jobs:
       - name: Merge main into nightly
         run: |
           git checkout -B nightly origin/nightly
-          git merge upstream/main --no-edit
+          git merge upstream/main -X theirs --no-edit
           git push origin nightly --force
           git tag -f tip HEAD
           git push origin tip --force
